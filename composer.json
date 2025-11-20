@@ -1,7 +1,7 @@
 {
     "name": "blax-software/laravel-workkit",
     "type": "library",
-    "description": "Laravel collection of helpers and utilities to speed up development.",
+    "description": "Laravel collection of helpers and utilities to reduce redundant code over multiple projects.",
     "keywords": [],
     "homepage": "http://www.blax.at",
     "license": "MIT",
