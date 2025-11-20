@@ -16,21 +16,27 @@
     "autoload": {
         "psr-4": {
             "Blax\\Workkit\\": "src"
-        }
+        },
+        "files": [
+            "src/helpers.php"
+        ]
     },
     "config": {
         "sort-packages": true
     },
     "require": {
         "php": ">=8.0",
-        "laravel/framework": "*"
+        "laravel/framework": "*",
+        "spatie/once": "*"
     },
     "require-dev": {
         "laravel/pint": "^1.22"
     },
     "extra": {
         "laravel": {
-            "providers": []
+            "providers": [
+                "Blax\\Workkit\\WorkkitServiceProvider"
+            ]
         }
     },
     "minimum-stability": "dev",
