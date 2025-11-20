@@ -2,7 +2,6 @@
 
 namespace Blax\Workkit\Services;
 
-use App\Services\IncompleteJsonService;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 

@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Services;
+namespace Blax\Workkit\Services;
 
 use JsonException;
 
@@ -27,7 +27,7 @@ class IncompleteJsonService
         }
 
         $this->onExtraToken = function ($text, $data, $reminding) {
-            echo 'Parsed JSON with extra tokens: '.json_encode(['text' => $text, 'data' => $data, 'reminding' => $reminding]);
+            echo 'Parsed JSON with extra tokens: ' . json_encode(['text' => $text, 'data' => $data, 'reminding' => $reminding]);
         };
     }
 
