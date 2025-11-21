@@ -17,7 +17,7 @@ trait HasMetaTranslation
             $r->i18n = (object) $r->i18n;
         }
 
-        foreach (config('app.i18n.supporting') as $lang => $longlang) {
+        foreach (config('app.i18n.supporting', (object) []) as $lang => $longlang) {
             if ($lang == 'en') {
                 continue;
             }
@@ -204,7 +204,7 @@ trait HasMetaTranslation
 
         $missing = [];
 
-        foreach (config('app.i18n.supporting') as $lang => $longlang) {
+        foreach (config('app.i18n.supporting', []) as $lang => $longlang) {
             if ($lang == 'en') {
                 continue;
             }
