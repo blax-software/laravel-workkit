@@ -32,4 +32,22 @@ trait HasExpiration
 
         $this->save();
     }
+
+    public function scopeExpired($query)
+    {
+        return $query
+            ->withoutGlobalScope('willExpire')
+            ->whereNotNull('expires_at')
+            ->where('expires_at', '<=', now());
+    }
+
+    public function scopeWillExpire($query)
+    {
+        return $query
+            ->withoutGlobalScope('willExpire')
+            ->where(function ($query) {
+                $query->whereNull('expires_at')
+                    ->orWhere('expires_at', '>', now());
+            });
+    }
 }
