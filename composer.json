@@ -27,7 +27,7 @@
     "require": {
         "php": ">=8.0",
         "laravel/framework": "*",
-        "laravel/sanctum": "^4.2",
+        "laravel/sanctum": "*",
         "spatie/once": "*"
     },
     "require-dev": {
