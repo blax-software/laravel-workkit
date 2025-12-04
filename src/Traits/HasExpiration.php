@@ -50,4 +50,23 @@ trait HasExpiration
                     ->orWhere('expires_at', '>', now());
             });
     }
+
+    public function scopeWithExpired($query)
+    {
+        return $query->withoutGlobalScope('willExpire');
+    }
+
+    public function scopeExpiresWithinHours($query, int $hours)
+    {
+        return $query
+            ->withoutGlobalScope('willExpire')
+            ->whereBetween('expires_at', [now(), now()->addHours($hours)]);
+    }
+
+    public function scopeExpiresFromTo($query, $from, $to)
+    {
+        return $query
+            ->withoutGlobalScope('willExpire')
+            ->whereBetween('expires_at', [$from, $to]);
+    }
 }
