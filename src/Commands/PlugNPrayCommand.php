@@ -233,10 +233,11 @@ services:
 YAML;
 
         if ($websocket) {
-            $yaml .= "      PUSHER_PORT: \"{$websocketPort}\"\n";
+            $yaml .= "\n      PUSHER_PORT: \"{$websocketPort}\"";
         }
 
         $yaml .= <<<YAML
+
     networks:
       - web
       - internal
@@ -256,6 +257,7 @@ YAML;
 
         if ($websocket) {
             $yaml .= <<<YAML
+
       # WebSocket
       - traefik.http.routers.{$name}-ws.rule=Host(`ws-{$host}`)
       - traefik.http.routers.{$name}-ws.entrypoints=web
