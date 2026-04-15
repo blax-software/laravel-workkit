@@ -2,6 +2,8 @@
 
 namespace Blax\Workkit;
 
+use Blax\Workkit\Commands\PlugNPrayCommand;
+
 class WorkkitServiceProvider extends \Illuminate\Support\ServiceProvider
 {
     /**
@@ -21,6 +23,10 @@ class WorkkitServiceProvider extends \Illuminate\Support\ServiceProvider
      */
     public function boot()
     {
-        // 
+        if ($this->app->runningInConsole()) {
+            $this->commands([
+                PlugNPrayCommand::class,
+            ]);
+        }
     }
 }
