@@ -7,23 +7,104 @@ use Illuminate\Support\Facades\Log;
 
 class MiscService
 {
+    /**
+     * Build a standard response payload envelope.
+     */
+    public static function response(
+        mixed $data = null,
+        array $meta = []
+    ): array {
+        return [
+            'data' => $data,
+            'meta' => $meta,
+        ];
+    }
+
+    /**
+     * Resolve a controller payload to a normalized options array.
+     *
+     * Supported payload shapes:
+     * - ['options' => [...]]
+     * - [...] (already flat)
+     */
+    public static function resolveOptions(
+        array $payload,
+        array $defaults = []
+    ): array {
+        $options = is_array($payload['options'] ?? null)
+            ? $payload['options']
+            : $payload;
+
+        return array_merge($defaults, $options);
+    }
+
+    /**
+     * Read an option value using camelCase or snake_case fallback.
+     */
+    public static function option(
+        array $options,
+        string $key,
+        mixed $default = null
+    ): mixed {
+        if (array_key_exists($key, $options)) {
+            return $options[$key];
+        }
+
+        $snake = str($key)->snake()->toString();
+        if (array_key_exists($snake, $options)) {
+            return $options[$snake];
+        }
+
+        $camel = str($key)->camel()->toString();
+        if (array_key_exists($camel, $options)) {
+            return $options[$camel];
+        }
+
+        return $default;
+    }
+
+    /**
+     * Build pagination metadata in a consistent format.
+     */
+    public static function paginationMeta(
+        $paginated,
+        array $options = [],
+        array $meta = []
+    ): array {
+        $data = $paginated->toArray();
+
+        $base = [
+            'from' => @$data['from'],
+            'to' => @$data['to'],
+            'total' => @$data['total'],
+            'last_page' => @$data['last_page'],
+            'current_page' => @$data['current_page'],
+            'options' => (object) $options,
+        ];
+
+        if ($meta) {
+            $base = array_merge($base, $meta);
+        }
+
+        return $base;
+    }
+
     public static function asPaginated(
         $paginated,
         $resource_class,
-        array $meta = []
+        array $meta = [],
+        ?array $options = null
     ) {
-        $data = $paginated->toArray();
+        $resolvedOptions = $options;
+        if ($resolvedOptions === null) {
+            $resolvedOptions = is_array(request('options'))
+                ? request('options')
+                : [];
+        }
 
         $payload = [
             'data' => $resource_class::collection($paginated),
-            'meta' => [
-                'from' => @$data['from'],
-                'to' => @$data['to'],
-                'total' => @$data['total'],
-                'last_page' => @$data['last_page'],
-                'current_page' => @$data['current_page'],
-                'options' => (object) request('options'),
-            ],
+            'meta' => self::paginationMeta($paginated, $resolvedOptions),
         ];
 
         if ($meta) {
