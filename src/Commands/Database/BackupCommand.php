@@ -9,20 +9,22 @@ use Illuminate\Console\Command;
 use RuntimeException;
 
 /**
- * Dump the configured MySQL database to a compressed + APP_KEY-encrypted
- * file under storage/backups. Output filename is
- *   db_<connection>_<timestamp>.sql.xz.enc
+ * Stream a MySQL dump through xz and openssl into a single
+ * APP_KEY-encrypted file under storage/backups. The whole pipeline
+ * is one shell pipe (mysqldump | xz | openssl); PHP holds zero bytes
+ * of database content in memory regardless of dump size.
  *
- * The DB password is passed to mysqldump via the MYSQL_PWD env var, not
- * on the CLI — process listings (`ps auxf`) don't expose it that way.
+ * Output filename:
+ *   storage/backups/db_<connection>_<timestamp>.sql.xz.enc
  */
 class BackupCommand extends Command
 {
     protected $signature = 'workkit:db:backup
         {--connection= : DB connection to back up (defaults to config(database.default))}
-        {--out= : Custom output path (overrides storage/backups default)}';
+        {--out= : Custom output path (overrides storage/backups default)}
+        {--xz-level= : xz compression level 0–9 (default: 3 — fast, ~10× ratio for SQL)}';
 
-    protected $description = 'Create a compressed + encrypted backup of the configured MySQL database.';
+    protected $description = 'Create a streamed, compressed + APP_KEY-encrypted backup of the configured MySQL database.';
 
     public function handle(): int
     {
@@ -38,72 +40,36 @@ class BackupCommand extends Command
             return self::FAILURE;
         }
 
-        try {
-            BackupService::requireBinary('mysqldump');
-        } catch (RuntimeException $e) {
-            $this->error($e->getMessage());
-            return self::FAILURE;
-        }
-
         $stamp = date('Y-m-d_H-i-s');
         $base = BackupService::backupDirectory();
-        $sqlPath = $this->option('out')
-            ?: "{$base}/db_{$connection}_{$stamp}.sql";
+        $outPath = $this->option('out')
+            ?: "{$base}/db_{$connection}_{$stamp}.sql.xz.enc";
 
-        $this->info("Dumping `{$cfg['database']}` from {$cfg['host']} → {$sqlPath}");
+        $xzLevel = (int) ($this->option('xz-level') ?? config('workkit.backup.xz_level', 3));
 
+        $this->info(sprintf(
+            'Streaming dump → xz -%d → openssl → %s',
+            $xzLevel,
+            $outPath,
+        ));
+
+        $startedAt = microtime(true);
         try {
-            $this->dump($cfg, $sqlPath);
-
-            $this->info('Compressing with xz…');
-            $xzPath = BackupService::compressFile($sqlPath);
-            @unlink($sqlPath);
-
-            $this->info('Encrypting with APP_KEY…');
-            $encPath = BackupService::encryptFile($xzPath);
-            @unlink($xzPath);
+            BackupService::dumpCompressEncrypt($cfg, $outPath, $xzLevel);
         } catch (RuntimeException $e) {
-            // Clean up any half-written intermediate files so a failed
-            // backup doesn't leave SQL with secrets sitting unencrypted
-            // on disk.
-            foreach ([$sqlPath, $sqlPath . '.xz'] as $leftover) {
-                if (is_file($leftover)) {
-                    @unlink($leftover);
-                }
-            }
             $this->error($e->getMessage());
             return self::FAILURE;
         }
 
-        $size = filesize($encPath);
-        $this->info(sprintf('Backup complete: %s (%s)', $encPath, self::humanBytes((int) $size)));
+        $elapsed = microtime(true) - $startedAt;
+        $size = filesize($outPath);
+        $this->info(sprintf(
+            'Backup complete in %.1fs: %s (%s)',
+            $elapsed,
+            $outPath,
+            self::humanBytes((int) $size),
+        ));
         return self::SUCCESS;
-    }
-
-    /**
-     * Run mysqldump with credentials passed via env vars (MYSQL_PWD) so
-     * the password never appears in the process listing or shell history.
-     */
-    private function dump(array $cfg, string $sqlPath): void
-    {
-        $args = [
-            '--single-transaction',  // consistent dump on InnoDB without FLUSH TABLES locking
-            '--quick',               // stream rows instead of buffering
-            '--skip-lock-tables',
-            '--user=' . escapeshellarg((string) ($cfg['username'] ?? 'root')),
-            '--host=' . escapeshellarg((string) ($cfg['host'] ?? 'localhost')),
-            '--port=' . escapeshellarg((string) ($cfg['port'] ?? 3306)),
-            escapeshellarg((string) $cfg['database']),
-        ];
-
-        $cmd = 'mysqldump ' . implode(' ', $args) . ' > ' . escapeshellarg($sqlPath);
-        BackupService::run($cmd, [
-            'MYSQL_PWD' => (string) ($cfg['password'] ?? ''),
-        ]);
-
-        if (! file_exists($sqlPath) || filesize($sqlPath) === 0) {
-            throw new RuntimeException("mysqldump produced no output at {$sqlPath}");
-        }
     }
 
     private static function humanBytes(int $bytes): string

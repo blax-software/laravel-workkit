@@ -4,92 +4,155 @@ declare(strict_types=1);
 
 namespace Blax\Workkit\Services;
 
-use Illuminate\Support\Facades\Crypt;
 use RuntimeException;
 
 /**
- * Compression + encryption primitives shared by the backup/restore
- * commands. Encryption uses Laravel's Crypt facade, so the AES key is
- * derived from APP_KEY — same key that decrypts the rest of the app's
- * encrypted columns/cookies. That means a backup is restorable only
- * by a deployment that knows the host's APP_KEY.
+ * Streaming backup pipeline. Dumps, compresses and encrypts in a single
+ * shell pipe so PHP holds zero bytes of the database content in memory —
+ * regardless of dump size. The original implementation ran each stage
+ * separately and ran into "Allowed memory size exhausted" on
+ * mid-three-digit-MB compressed dumps because Laravel's `Crypt::encryptString`
+ * reads the whole file, base64-encodes (+33%) and JSON-envelopes it.
  *
- * Compression goes through the system `xz` binary because it gives by
- * far the best ratio for repetitive SQL dump text and is cheap to
- * stream. Hosts without `xz` installed get a clear failure rather
- * than silently falling back to a worse codec.
+ * Encryption: AES-256-CBC with PBKDF2 (600 000 iterations, random salt)
+ * via the system `openssl` binary. The passphrase is derived from
+ * APP_KEY (the `base64:` prefix is stripped, the remainder is used
+ * verbatim — PBKDF2 stretches it into the key). A backup is restorable
+ * only by a deployment that knows the same APP_KEY.
+ *
+ * The output file format is the standard `openssl enc -salt` format,
+ * which means it's also restorable with vanilla openssl on any host:
+ *   openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:K \
+ *     -in backup.sql.xz.enc | xz -d | mysql ...
+ *
+ * Required system binaries: `mysqldump`, `mysql`, `xz`, `openssl`,
+ * `bash` (for `set -o pipefail`). All are standard on every reasonable
+ * Linux server.
  */
 class BackupService
 {
+    public const CIPHER = 'aes-256-cbc';
+    public const PBKDF2_ITER = 600000;
+
     /**
-     * Compress $in with `xz` and return the path of the .xz output.
-     * Defaults to writing alongside the input.
+     * mysqldump → xz → openssl enc → $outPath. One pipeline, zero PHP
+     * memory pressure. Pipefail propagates a failure in any stage out
+     * to the caller as a non-zero exit code.
+     *
+     * $xzLevel defaults to 3 — empirically a good balance for SQL
+     * (about 10× compression with a fraction of xz -9's time cost).
      */
-    public static function compressFile(string $in, ?string $out = null): string
+    public static function dumpCompressEncrypt(array $cfg, string $outPath, int $xzLevel = 3): void
     {
-        $out ??= $in . '.xz';
+        self::requireBinary('mysqldump');
         self::requireBinary('xz');
-        // -9 for max ratio, -T0 for parallel encoding on whatever cores
-        // the host has. -c emits to stdout so we don't clobber $in in
-        // place — the caller decides when to delete it.
-        self::run(sprintf('xz -z -9 -T0 -c %s > %s', escapeshellarg($in), escapeshellarg($out)));
-        if (! file_exists($out)) {
-            throw new RuntimeException("xz compression failed; output not found at {$out}");
+        self::requireBinary('openssl');
+        self::requireBinary('bash');
+
+        $level = max(0, min(9, $xzLevel));
+
+        $mysqldump = 'mysqldump '
+            . '--single-transaction --quick --skip-lock-tables '
+            . '--user=' . escapeshellarg((string) ($cfg['username'] ?? 'root')) . ' '
+            . '--host=' . escapeshellarg((string) ($cfg['host'] ?? 'localhost')) . ' '
+            . '--port=' . escapeshellarg((string) ($cfg['port'] ?? 3306)) . ' '
+            . escapeshellarg((string) $cfg['database']);
+
+        $xz      = "xz -{$level} -T0";
+        $openssl = 'openssl enc -' . self::CIPHER . ' -pbkdf2 -iter ' . self::PBKDF2_ITER . ' -salt -pass env:WK_KEY';
+
+        // bash -c with pipefail: any stage failing trips the whole
+        // pipeline. Without pipefail, a mysqldump crash with xz still
+        // running would leave the output file 0-byte and the exit
+        // code 0 — silent corruption.
+        $pipeline = "{$mysqldump} | {$xz} | {$openssl} > " . escapeshellarg($outPath);
+        $cmd = '/bin/bash -c ' . escapeshellarg('set -o pipefail; ' . $pipeline);
+
+        try {
+            self::run($cmd, [
+                'MYSQL_PWD' => (string) ($cfg['password'] ?? ''),
+                'WK_KEY'    => self::passphrase(),
+            ]);
+        } catch (RuntimeException $e) {
+            // Don't leave a half-written encrypted file lying around —
+            // it's neither valid plaintext (which we'd never want)
+            // nor a complete backup, just confusing partial state.
+            if (is_file($outPath)) {
+                @unlink($outPath);
+            }
+            throw $e;
         }
-        return $out;
+
+        if (! file_exists($outPath) || filesize($outPath) === 0) {
+            throw new RuntimeException("Backup pipeline produced no output at {$outPath}");
+        }
     }
 
     /**
-     * Decompress an .xz file. If $out is null, strips the `.xz` suffix
-     * (or generates a uniquely-named sibling if there is none).
+     * openssl dec → xz -d → mysql. Streams through the same pipeline
+     * in reverse. Does no PHP-side decoding so the file size is bounded
+     * only by disk I/O.
      */
-    public static function decompressFile(string $in, ?string $out = null): string
+    public static function decryptDecompressImport(string $inPath, array $cfg): void
     {
+        self::requireBinary('mysql');
         self::requireBinary('xz');
-        if ($out === null) {
-            $out = str_ends_with($in, '.xz')
-                ? substr($in, 0, -3)
-                : $in . '.decompressed';
+        self::requireBinary('openssl');
+        self::requireBinary('bash');
+
+        // Sanity check on the file's magic bytes. `openssl enc -salt`
+        // output always starts with the literal "Salted__" header.
+        $head = (string) @file_get_contents($inPath, false, null, 0, 8);
+        if ($head !== 'Salted__') {
+            throw new RuntimeException(
+                "File at {$inPath} doesn't look like a streaming openssl backup. "
+                . 'Legacy backups (made with the pre-streaming Crypt envelope) need '
+                . 'a separate restore path; see workkit:db:restore-legacy or restore '
+                . 'manually with `Crypt::decryptString` after raising memory_limit.'
+            );
         }
-        self::run(sprintf('xz -d -T0 -c %s > %s', escapeshellarg($in), escapeshellarg($out)));
-        if (! file_exists($out)) {
-            throw new RuntimeException("xz decompression failed; output not found at {$out}");
-        }
-        return $out;
+
+        $openssl = 'openssl enc -d -' . self::CIPHER
+            . ' -pbkdf2 -iter ' . self::PBKDF2_ITER
+            . ' -pass env:WK_KEY '
+            . '-in ' . escapeshellarg($inPath);
+
+        $mysql = 'mysql '
+            . '--user=' . escapeshellarg((string) ($cfg['username'] ?? 'root')) . ' '
+            . '--host=' . escapeshellarg((string) ($cfg['host'] ?? 'localhost')) . ' '
+            . '--port=' . escapeshellarg((string) ($cfg['port'] ?? 3306)) . ' '
+            . escapeshellarg((string) $cfg['database']);
+
+        $pipeline = "{$openssl} | xz -d -T0 | {$mysql}";
+        $cmd = '/bin/bash -c ' . escapeshellarg('set -o pipefail; ' . $pipeline);
+
+        self::run($cmd, [
+            'MYSQL_PWD' => (string) ($cfg['password'] ?? ''),
+            'WK_KEY'    => self::passphrase(),
+        ]);
     }
 
     /**
-     * Encrypt $in with Crypt:: (APP_KEY-derived) and return the path
-     * of the .enc output.
+     * Derive the openssl passphrase from APP_KEY. Laravel stores APP_KEY
+     * as "base64:<random-bytes>"; we strip the prefix and feed the rest
+     * straight to openssl, which runs PBKDF2 over it to get the AES key.
+     * Same APP_KEY always derives the same key — restore is deterministic.
      */
-    public static function encryptFile(string $in, ?string $out = null): string
+    public static function passphrase(): string
     {
-        $out ??= $in . '.enc';
-        $payload = Crypt::encryptString(file_get_contents($in));
-        file_put_contents($out, $payload);
-        return $out;
-    }
-
-    /**
-     * Decrypt $in (Crypt:: payload) and write to $out. If $out is null,
-     * strips the `.enc` suffix.
-     */
-    public static function decryptFile(string $in, ?string $out = null): string
-    {
-        if ($out === null) {
-            $out = str_ends_with($in, '.enc')
-                ? substr($in, 0, -4)
-                : $in . '.decrypted';
+        $key = (string) config('app.key');
+        if ($key === '') {
+            throw new RuntimeException('APP_KEY is empty. Run `php artisan key:generate` before using the backup commands.');
         }
-        $payload = file_get_contents($in);
-        file_put_contents($out, Crypt::decryptString($payload));
-        return $out;
+        if (str_starts_with($key, 'base64:')) {
+            $key = substr($key, 7);
+        }
+        return $key;
     }
 
     /**
-     * Path of the host's backup directory, created if missing.
-     * Defaults to storage/backups; the host can override via the
-     * `workkit.backup.path` config (published by the package).
+     * Path of the host's backup directory, created if missing. Defaults
+     * to storage/backups; overridable via config('workkit.backup.path').
      */
     public static function backupDirectory(): string
     {
@@ -101,9 +164,9 @@ class BackupService
     }
 
     /**
-     * Bail loudly if a required system binary isn't on $PATH. We do
-     * this early in each command so users get one clear message
-     * instead of a cryptic exec failure halfway through.
+     * Bail loudly if a required system binary isn't on PATH. Done early
+     * in each command so users get one clear message instead of a
+     * cryptic exec failure halfway through.
      */
     public static function requireBinary(string $bin): void
     {
@@ -114,7 +177,10 @@ class BackupService
     }
 
     /**
-     * Run a shell command and throw on non-zero exit.
+     * Run a shell command and throw on non-zero exit, capturing stderr
+     * for the error message. Env vars are passed via proc_open's env
+     * arg — they're scoped to the child process and not visible in the
+     * host's `ps` listing.
      */
     public static function run(string $command, array $env = []): void
     {
@@ -131,15 +197,14 @@ class BackupService
         }
 
         fclose($pipes[0]);
-        // We don't need stdout — most of these commands write to files.
-        $stderr = stream_get_contents($pipes[2]);
         fclose($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
         fclose($pipes[2]);
         $exit = proc_close($proc);
 
         if ($exit !== 0) {
             throw new RuntimeException(sprintf(
-                "Command failed (exit %d): %s\nstderr:\n%s",
+                "Command failed (exit %d):\n  %s\nstderr:\n%s",
                 $exit,
                 self::redactCommand($command),
                 trim((string) $stderr) ?: '(empty)'
@@ -149,8 +214,8 @@ class BackupService
 
     /**
      * Hide credential-looking flags in error messages so we don't dump
-     * passwords to logs. Crude but enough for the legacy CLI flag form;
-     * the commands themselves prefer MYSQL_PWD env vars.
+     * passwords to logs. The streaming pipeline doesn't put creds on
+     * the CLI (everything goes via env vars), but defence in depth.
      */
     private static function redactCommand(string $command): string
     {

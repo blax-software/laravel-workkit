@@ -16,5 +16,8 @@ return [
     'backup' => [
         'path' => env('WORKKIT_BACKUP_PATH'),  // null → storage_path('backups')
         'retention_days' => (int) env('WORKKIT_BACKUP_RETENTION_DAYS', 30),
+        // xz compression level. Lower = faster + larger output. 3 is a
+        // good default for SQL dumps (~10× ratio at ~3× the speed of -9).
+        'xz_level' => (int) env('WORKKIT_BACKUP_XZ_LEVEL', 3),
     ],
 ];
