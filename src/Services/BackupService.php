@@ -153,13 +153,54 @@ class BackupService
     /**
      * Path of the host's backup directory, created if missing. Defaults
      * to storage/backups; overridable via config('workkit.backup.path').
+     *
+     * Group-writable on purpose — the dir is often created once at deploy
+     * time (as root or whoever ran the first artisan command) and then
+     * written by www-data at runtime. If we can't make it writable for
+     * the current user, we throw with the exact `chown`/`chmod` to run,
+     * because the alternative is the bash redirect failing mid-pipeline
+     * with `Permission denied` after mysqldump has already started.
      */
     public static function backupDirectory(): string
     {
         $path = config('workkit.backup.path') ?: storage_path('backups');
+
         if (! is_dir($path)) {
-            mkdir($path, 0755, true);
+            // Suppress because a tight parent dir or umask can race here;
+            // the is_dir() check below is the real gate.
+            @mkdir($path, 0775, true);
+            if (! is_dir($path)) {
+                throw new RuntimeException("Failed to create backup directory: {$path}");
+            }
         }
+
+        // Best-effort widen — only succeeds when we own the dir, which is
+        // exactly when the perms were already too narrow to begin with.
+        @chmod($path, 0775);
+
+        if (! is_writable($path)) {
+            $owner = '?';
+            $current = '?';
+            if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+                $statOwner = @fileowner($path);
+                if ($statOwner !== false) {
+                    $owner = posix_getpwuid($statOwner)['name'] ?? (string) $statOwner;
+                }
+                $current = posix_getpwuid(posix_geteuid())['name'] ?? (string) posix_geteuid();
+            }
+            throw new RuntimeException(sprintf(
+                "Backup directory not writable: %s\n"
+                . "  owner=%s, current user=%s\n"
+                . "  Fix as root:  chown -R %s %s && chmod 0775 %s",
+                $path,
+                $owner,
+                $current,
+                $current,
+                $path,
+                $path
+            ));
+        }
+
         return rtrim($path, '/');
     }
 
