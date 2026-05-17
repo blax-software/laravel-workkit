@@ -8,26 +8,19 @@ use Illuminate\Support\Facades\Log;
 /**
  * Grab-bag of small utilities used across Blax host apps.
  *
- * Response-envelope helpers (`response`, `apiResponse`, `apiMeta`,
- * `apiItem`, `apiCollection`, `apiPaginated`, `asPaginated`,
- * `paginationMeta`, `availableLanguages`) have moved to
- * {@see ResponseService} — they remain here as thin shims so existing
- * callers continue to work without changes. Prefer calling
- * {@see ResponseService} directly in new code.
+ * Response-envelope helpers live on {@see ResponseService} now and the old
+ * shims here have been retired alongside the legacy methods
+ * (`response`, `apiResponse`, `asPaginated`, `paginationMeta`) that were
+ * dropped from ResponseService itself. The remaining `apiItem`,
+ * `apiCollection`, `apiPaginated`, `apiMeta`, `availableLanguages` shims
+ * stay for the moment as a courtesy to existing callers — new code should
+ * call {@see ResponseService} directly.
  */
 class MiscService
 {
     /* ──────────────────────────────────────────────────────────────────────
      * Response envelope (delegates to ResponseService)
      * ────────────────────────────────────────────────────────────────────── */
-
-    /**
-     * Build a raw `{ data, meta }` envelope. See {@see ResponseService::response()}.
-     */
-    public static function response(mixed $data = null, array $meta = []): array
-    {
-        return ResponseService::response($data, $meta);
-    }
 
     /**
      * Available content languages for the running app.
@@ -60,15 +53,6 @@ class MiscService
     }
 
     /**
-     * Plain envelope with the standard meta block.
-     * See {@see ResponseService::apiResponse()}.
-     */
-    public static function apiResponse(mixed $data = null, array $extraMeta = []): array
-    {
-        return ResponseService::apiResponse($data, $extraMeta);
-    }
-
-    /**
      * Non-paginated collection envelope.
      * See {@see ResponseService::apiCollection()}.
      *
@@ -87,30 +71,6 @@ class MiscService
     public static function apiPaginated(mixed $paginated, string $resource_class, array $extraMeta = []): array
     {
         return ResponseService::apiPaginated($paginated, $resource_class, $extraMeta);
-    }
-
-    /**
-     * Legacy paginated meta block.
-     * See {@see ResponseService::paginationMeta()}.
-     */
-    public static function paginationMeta(mixed $paginated, array $options = [], array $meta = []): array
-    {
-        return ResponseService::paginationMeta($paginated, $options, $meta);
-    }
-
-    /**
-     * Legacy paginated envelope.
-     * See {@see ResponseService::asPaginated()}.
-     *
-     * @param  class-string<\Illuminate\Http\Resources\Json\JsonResource>  $resource_class
-     */
-    public static function asPaginated(
-        mixed $paginated,
-        string $resource_class,
-        array $meta = [],
-        ?array $options = null,
-    ): array {
-        return ResponseService::asPaginated($paginated, $resource_class, $meta, $options);
     }
 
     /* ──────────────────────────────────────────────────────────────────────

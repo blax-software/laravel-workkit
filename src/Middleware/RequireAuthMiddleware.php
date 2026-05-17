@@ -2,7 +2,7 @@
 
 namespace Blax\Workkit\Middleware;
 
-use Blax\Workkit\Services\MiscService;
+use Blax\Workkit\Services\ResponseService;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -18,9 +18,10 @@ class RequireAuthMiddleware
     public function handle(Request $request, Closure $next, string $action = 'continue'): Response
     {
         if (! Auth::check()) {
-            return response()->json(
-                MiscService::apiResponse(['message' => "You need to be logged in to {$action}."]),
+            return ResponseService::apiError(
+                "You need to be logged in to {$action}.",
                 Response::HTTP_UNAUTHORIZED,
+                type: 'AuthenticationException',
             );
         }
 

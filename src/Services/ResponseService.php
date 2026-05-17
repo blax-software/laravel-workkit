@@ -2,45 +2,47 @@
 
 namespace Blax\Workkit\Services;
 
-use Illuminate\Contracts\Pagination\Paginator;
+use Illuminate\Http\JsonResponse;
+use Symfony\Component\HttpFoundation\Response;
+use Throwable;
 
 /**
  * API response envelope builder.
  *
- * Every method here produces the workkit response shape `{ data, meta }`.
- * The richer helpers (`apiItem`, `apiCollection`, `apiPaginated`,
- * `apiResponse`) auto-fill a standard meta block via {@see apiMeta()},
- * which carries the request `url`, the active `locale`, and the list of
- * available `languages`. Pagination metadata is merged on top by
- * {@see apiPaginated()}.
+ * Every helper here — success or error — produces the same wire shape:
  *
- * This service is the canonical home for these helpers. The matching
- * methods on {@see MiscService} remain as thin shims for backward
- * compatibility — existing callers do not need to change.
+ *   {
+ *     "status":  { "code": <int>, "text": <reason phrase> },
+ *     "message": <human readable | null>,
+ *     "data":    <payload | absent>,        // success only
+ *     "error":   <{ type, ... } | absent>,  // error only
+ *     "errors":  <{ field: [...] } | absent>, // present for validation errors
+ *     "meta":    { url, locale, languages, ...pagination... }
+ *   }
  *
- * Lifecycle in a controller:
+ * The split is: `data` carries success payloads, `error` carries failure
+ * details, `errors` is the Laravel-compatible field-map alias so
+ * `assertJsonValidationErrors([...])` keeps working without re-jiggering tests.
+ * Every response also reports its HTTP status as both code and reason phrase
+ * inside the body — useful for clients that can't easily inspect headers.
  *
- *   return response()->json(ResponseService::apiPaginated($q->paginate(), BookResource::class));
- *   return response()->json(ResponseService::apiItem($book, BookResource::class));
- *   return response()->json(ResponseService::apiResponse(['token' => $token]), 201);
+ * Controller lifecycle under {@see \Blax\Workkit\Middleware\ForceJsonResponse}:
+ *
+ *   200 OK         → return ResponseService::apiItem(...) (plain array)
+ *   200 OK list    → return ResponseService::apiPaginated($q->paginate(...), ...)
+ *   201 Created    → return ResponseService::apiCreated(...) (JsonResponse)
+ *   202 Accepted   → return ResponseService::apiAccepted(...) (JsonResponse)
+ *   204 No Content → return ResponseService::apiNoContent()  (JsonResponse)
+ *   4xx/5xx        → return ResponseService::apiError(...)   (JsonResponse)
+ *   422 validation → return ResponseService::apiValidationError([...]) (JsonResponse)
+ *
+ * Reach for `response()->json(...)` directly only if you genuinely need a
+ * status code or shape not modeled above — in which case prefer to add a
+ * helper here so the convention stays uniform.
  */
 class ResponseService
 {
-    /**
-     * Build a raw `{ data, meta }` envelope with whatever meta you pass.
-     *
-     * Lowest-level primitive — every other method here ultimately produces
-     * this same shape. Prefer the higher-level helpers
-     * (`apiResponse`, `apiItem`, `apiCollection`, `apiPaginated`) which
-     * auto-fill the standard meta block.
-     */
-    public static function response(mixed $data = null, array $meta = []): array
-    {
-        return [
-            'data' => $data,
-            'meta' => $meta,
-        ];
-    }
+    /* ─────────────────────────── building blocks ──────────────────────── */
 
     /**
      * Available content languages for the running app.
@@ -73,10 +75,8 @@ class ResponseService
     }
 
     /**
-     * Standard meta block: `url`, `locale`, `languages`, plus any extras.
-     *
-     * Pagination keys are merged in by {@see apiPaginated()};
-     * {@see apiItem()} and {@see apiCollection()} skip them.
+     * Standard meta block: `url`, `locale`, `languages`, plus any extras
+     * (the per-helper additions like pagination keys land here).
      *
      * @param  array<string, mixed>  $extra
      * @return array<string, mixed>
@@ -91,164 +91,230 @@ class ResponseService
     }
 
     /**
-     * Single-item envelope. Use for any `show`-style endpoint.
+     * Internal envelope builder used by every success/error helper. Keeping
+     * a single source of truth here means the wire shape can't drift between
+     * helpers — a new top-level key only needs to be added in one place.
      *
-     * Pass the resource class to wrap the model in a `JsonResource`, or
-     * omit it to serialize the value directly (this is also the form to
-     * use for arbitrary payloads — login responses, action acks, etc.).
+     * @param  array<string, mixed>  $payload Body keys (data/error/errors)
+     * @param  array<string, mixed>  $extraMeta
+     * @return array<string, mixed>
+     */
+    private static function envelope(
+        int $statusCode,
+        ?string $message,
+        array $payload,
+        array $extraMeta = [],
+    ): array {
+        return array_merge([
+            'status' => [
+                'code' => $statusCode,
+                'text' => Response::$statusTexts[$statusCode] ?? 'Unknown',
+            ],
+            'message' => $message,
+        ], $payload, [
+            'meta' => self::apiMeta($extraMeta),
+        ]);
+    }
+
+    /* ─────────────────────────────── success ──────────────────────────── */
+
+    /**
+     * Single-item envelope. Use for any `show`-style endpoint or for an
+     * arbitrary payload (login receipt, ack, etc. — pass `null` resource).
      *
      * @param  class-string<\Illuminate\Http\Resources\Json\JsonResource>|null  $resourceClass
      * @param  array<string, mixed>  $extraMeta
-     * @return array{data: mixed, meta: array<string, mixed>}
+     * @return array{status: array{code:int,text:string}, message: ?string, data: mixed, meta: array<string, mixed>}
      */
-    public static function apiItem(mixed $item, ?string $resourceClass = null, array $extraMeta = []): array
-    {
-        return self::response(
-            $resourceClass !== null ? $resourceClass::make($item) : $item,
-            self::apiMeta($extraMeta),
-        );
+    public static function apiItem(
+        mixed $item,
+        ?string $resourceClass = null,
+        array $extraMeta = [],
+        ?string $message = null,
+    ): array {
+        return self::envelope(200, $message, [
+            'data' => $resourceClass !== null ? $resourceClass::make($item) : $item,
+        ], $extraMeta);
     }
 
     /**
-     * Plain envelope with the standard meta block.
-     *
-     * Alias of `apiItem($data, null, $extraMeta)` kept for callers whose
-     * intent is "arbitrary payload" rather than "model" — login responses,
-     * acknowledgements, etc.
-     *
-     * @param  array<string, mixed>  $extraMeta
-     * @return array{data: mixed, meta: array<string, mixed>}
-     */
-    public static function apiResponse(mixed $data = null, array $extraMeta = []): array
-    {
-        return self::apiItem($data, null, $extraMeta);
-    }
-
-    /**
-     * Non-paginated collection envelope.
-     *
-     * Reserve this for genuinely tiny fixed lists (an enum, a child
-     * collection embedded in a parent show response). Most list endpoints
-     * should use {@see apiPaginated()}.
+     * Non-paginated collection envelope. Reserve for genuinely tiny fixed
+     * lists (an enum, a child collection embedded in a parent response).
+     * Most list endpoints should use {@see apiPaginated()}.
      *
      * @param  class-string<\Illuminate\Http\Resources\Json\JsonResource>  $resourceClass
      * @param  array<string, mixed>  $extraMeta
-     * @return array{data: mixed, meta: array<string, mixed>}
+     * @return array<string, mixed>
      */
-    public static function apiCollection(iterable $items, string $resourceClass, array $extraMeta = []): array
-    {
+    public static function apiCollection(
+        iterable $items,
+        string $resourceClass,
+        array $extraMeta = [],
+        ?string $message = null,
+    ): array {
         $count = is_countable($items) ? count($items) : null;
 
-        return self::response(
-            $resourceClass::collection($items),
-            self::apiMeta(array_merge(['total' => $count], $extraMeta)),
-        );
+        return self::envelope(200, $message, [
+            'data' => $resourceClass::collection($items),
+        ], array_merge(['total' => $count], $extraMeta));
     }
 
     /**
-     * Paginated envelope. Use for any `index`-style endpoint.
-     *
-     * Wire shape:
-     *
-     *   {
-     *     "data": [...resource collection...],
-     *     "meta": {
-     *       "url", "locale", "languages",
-     *       "current_page", "per_page", "from", "to",
-     *       "total", "total_pages", "last_page", "has_more"
-     *     }
-     *   }
-     *
-     * `last_page` is exposed alongside `total_pages` as an alias so
-     * consumers written against Laravel's native paginator key continue
-     * to work without a migration.
+     * Paginated envelope. Use for any `index`-style endpoint. The meta block
+     * picks up the paginator's `current_page`, `per_page`, `from`, `to`,
+     * `total`, `total_pages` / `last_page` (aliased so legacy clients keep
+     * working) and a `has_more` boolean.
      *
      * @param  \Illuminate\Contracts\Pagination\Paginator|mixed  $paginated
      * @param  class-string<\Illuminate\Http\Resources\Json\JsonResource>  $resourceClass
      * @param  array<string, mixed>  $extraMeta
-     * @return array{data: mixed, meta: array<string, mixed>}
+     * @return array<string, mixed>
      */
-    public static function apiPaginated(mixed $paginated, string $resourceClass, array $extraMeta = []): array
-    {
+    public static function apiPaginated(
+        mixed $paginated,
+        string $resourceClass,
+        array $extraMeta = [],
+        ?string $message = null,
+    ): array {
         $arr = method_exists($paginated, 'toArray') ? $paginated->toArray() : [];
         $current = $arr['current_page'] ?? 1;
         $last = $arr['last_page'] ?? null;
 
-        return self::response(
-            $resourceClass::collection($paginated),
-            self::apiMeta(array_merge([
-                'current_page' => $current,
-                'per_page' => $arr['per_page'] ?? null,
-                'from' => $arr['from'] ?? null,
-                'to' => $arr['to'] ?? null,
-                'total' => $arr['total'] ?? null,
-                'total_pages' => $last,
-                'last_page' => $last,
-                'has_more' => $last !== null && $current < $last,
-            ], $extraMeta)),
+        return self::envelope(200, $message, [
+            'data' => $resourceClass::collection($paginated),
+        ], array_merge([
+            'current_page' => $current,
+            'per_page' => $arr['per_page'] ?? null,
+            'from' => $arr['from'] ?? null,
+            'to' => $arr['to'] ?? null,
+            'total' => $arr['total'] ?? null,
+            'total_pages' => $last,
+            'last_page' => $last,
+            'has_more' => $last !== null && $current < $last,
+        ], $extraMeta));
+    }
+
+    /**
+     * Single-item envelope wrapped in a 201 Created JsonResponse. Use for
+     * any `store`-style endpoint.
+     *
+     * @param  class-string<\Illuminate\Http\Resources\Json\JsonResource>|null  $resourceClass
+     * @param  array<string, mixed>  $extraMeta
+     */
+    public static function apiCreated(
+        mixed $item,
+        ?string $resourceClass = null,
+        array $extraMeta = [],
+        ?string $message = null,
+    ): JsonResponse {
+        return response()->json(
+            self::envelope(201, $message, [
+                'data' => $resourceClass !== null ? $resourceClass::make($item) : $item,
+            ], $extraMeta),
+            Response::HTTP_CREATED,
         );
     }
 
     /**
-     * Legacy paginated meta block: slimmer than {@see apiMeta()}, no
-     * `url`/`locale`/`languages`, includes a passthrough `options` object
-     * reflecting the request's filter/sort state.
+     * 202 Accepted envelope — for endpoints that queue work and return a
+     * receipt rather than the final resource.
      *
-     * Retained for backward compatibility — new code should use
-     * {@see apiPaginated()}.
-     *
-     * @param  \Illuminate\Contracts\Pagination\Paginator|mixed  $paginated
-     * @param  array<string, mixed>  $options
-     * @param  array<string, mixed>  $meta
-     * @return array<string, mixed>
+     * @param  class-string<\Illuminate\Http\Resources\Json\JsonResource>|null  $resourceClass
+     * @param  array<string, mixed>  $extraMeta
      */
-    public static function paginationMeta(mixed $paginated, array $options = [], array $meta = []): array
+    public static function apiAccepted(
+        mixed $item = null,
+        ?string $resourceClass = null,
+        array $extraMeta = [],
+        ?string $message = null,
+    ): JsonResponse {
+        return response()->json(
+            self::envelope(202, $message, [
+                'data' => $resourceClass !== null ? $resourceClass::make($item) : $item,
+            ], $extraMeta),
+            Response::HTTP_ACCEPTED,
+        );
+    }
+
+    /**
+     * 204 No Content — carries no body. Useful for `delete`-style endpoints.
+     */
+    public static function apiNoContent(): JsonResponse
     {
-        $data = method_exists($paginated, 'toArray') ? $paginated->toArray() : [];
-
-        $base = [
-            'from' => $data['from'] ?? null,
-            'to' => $data['to'] ?? null,
-            'total' => $data['total'] ?? null,
-            'last_page' => $data['last_page'] ?? null,
-            'current_page' => $data['current_page'] ?? null,
-            'options' => (object) $options,
-        ];
-
-        return $meta ? array_merge($base, $meta) : $base;
+        return response()->json(null, Response::HTTP_NO_CONTENT);
     }
 
+    /* ──────────────────────────────── errors ──────────────────────────── */
+
     /**
-     * Legacy paginated envelope. Same intent as {@see apiPaginated()} but
-     * with the older meta shape — reads `options` off the current request
-     * when none are supplied.
+     * Generic error envelope. Accepts either:
      *
-     * Retained for backward compatibility — new code should use
-     * {@see apiPaginated()}.
+     *   - A {@see \Throwable} instance — its class becomes `error.type` and
+     *     its message becomes the envelope `message` (both overridable).
+     *   - A plain string — used as the envelope `message`. `type` defaults
+     *     to `'Error'` unless you pass it explicitly.
      *
-     * @param  \Illuminate\Contracts\Pagination\Paginator|mixed  $paginated
-     * @param  class-string<\Illuminate\Http\Resources\Json\JsonResource>  $resourceClass
-     * @param  array<string, mixed>  $meta
-     * @param  array<string, mixed>|null  $options
-     * @return array{data: mixed, meta: array<string, mixed>}
+     *     return ResponseService::apiError($e, 422, ['book' => ['...']]);
+     *     return ResponseService::apiError('Forbidden', 403);
+     *     return ResponseService::apiError('Rate limited', 429, type: 'TooManyRequests');
+     *
+     * @param  array<string, array<int, string>>  $errors Field-keyed
+     *         validation-style errors, mirrored into the top-level `errors`
+     *         key for {@see \Illuminate\Testing\TestResponse::assertJsonValidationErrors()}.
+     * @param  array<string, mixed>  $extraMeta
      */
-    public static function asPaginated(
-        mixed $paginated,
-        string $resourceClass,
-        array $meta = [],
-        ?array $options = null,
-    ): array {
-        $resolvedOptions = $options ?? (is_array(request('options')) ? request('options') : []);
-
-        $payload = self::response(
-            $resourceClass::collection($paginated),
-            self::paginationMeta($paginated, $resolvedOptions),
-        );
-
-        if ($meta) {
-            $payload['meta'] = array_merge($payload['meta'], $meta);
+    public static function apiError(
+        Throwable|string $errorOrMessage,
+        int $status = 500,
+        array $errors = [],
+        ?string $type = null,
+        ?string $message = null,
+        array $extraMeta = [],
+    ): JsonResponse {
+        if ($errorOrMessage instanceof Throwable) {
+            $type ??= class_basename($errorOrMessage);
+            $message ??= $errorOrMessage->getMessage();
+        } else {
+            $message ??= $errorOrMessage;
+            $type ??= 'Error';
         }
 
-        return $payload;
+        $payload = ['error' => ['type' => $type]];
+        if (! empty($errors)) {
+            $payload['errors'] = $errors;
+        }
+
+        return response()->json(
+            self::envelope($status, $message, $payload, $extraMeta),
+            $status,
+        );
+    }
+
+    /**
+     * 422 Unprocessable Entity wrapper around {@see apiError()} with the
+     * field-error map pre-filled. Mirrors the shape Laravel's default
+     * ValidationException renderer produces, so `assertJsonValidationErrors`
+     * keeps working — but the envelope also carries the unified `status`,
+     * `message`, `error` keys for the rest of the body.
+     *
+     *     return ResponseService::apiValidationError([
+     *         'book' => ['No copies of this book are currently available.'],
+     *     ]);
+     *
+     * @param  array<string, array<int, string>>  $errors
+     * @param  array<string, mixed>  $extraMeta
+     */
+    public static function apiValidationError(
+        array $errors,
+        ?string $message = null,
+        array $extraMeta = [],
+    ): JsonResponse {
+        return self::apiError(
+            errorOrMessage: $message ?? 'The given data was invalid.',
+            status: Response::HTTP_UNPROCESSABLE_ENTITY,
+            errors: $errors,
+            type: 'ValidationException',
+            extraMeta: $extraMeta,
+        );
     }
 }
