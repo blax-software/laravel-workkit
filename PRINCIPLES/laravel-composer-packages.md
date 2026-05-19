@@ -117,6 +117,32 @@ and runs it again, on top of the auto-loaded copy. By copying with
 `basename($sourcePath)` we keep the filenames identical, so the migrator
 deduplicates correctly.
 
+### Anti-pattern: fresh-timestamp publish
+
+The bug the filename-preserving publish prevents looks like this in a
+service provider:
+
+```php
+// ❌ Anti-pattern — produces 1050 errors on every consumer
+$this->publishes([
+    __DIR__ . '/../database/migrations/create_blax_files_table.php.stub'
+        => $this->getMigrationFileName('create_blax_files_table.php'),
+], 'files-migrations');
+
+protected function getMigrationFileName(string $name): string
+{
+    $timestamp = date('Y_m_d_His');
+    return $this->app->databasePath() . "/migrations/{$timestamp}_{$name}";
+}
+```
+
+Each `vendor:publish` produces a NEW filename. Combined with auto-load
+this guarantees the table gets created twice and the second run dies
+with `SQLSTATE[42S01]: 1050 Table 'files' already exists`. The fix is
+either (a) `basename($sourcePath)` in the publish map to inherit the
+source name, or (b) the `Schema::hasTable()` guards below — preferably
+both. Reference fix: [Blax\Files\FilesServiceProvider::offerPublishing()](/home/a6a2f5842/Documents/Repos/laravel-files/src/FilesServiceProvider.php).
+
 ### Idempotency requirement
 
 Every migration MUST be safe to run when its tables/columns already
@@ -126,6 +152,30 @@ and each `Schema::table` column addition with
 people *will* end up with both a published copy (with a different
 timestamp) and the auto-loaded copy, and we want graceful degradation
 instead of fatal errors.
+
+### Workbench schema must mirror the package schema
+
+The workbench `database/migrations/` directory is what your test suite
+runs against. It must reflect the SAME schema a consumer would see —
+either by:
+
+- **Letting the package auto-load do the work.** Don't reimplement the
+  package's own `Schema::create` calls in the workbench. The service
+  provider's `loadMigrationsFrom` fires during test boot too, so the
+  package's own migrations create the tables in the testbench DB. The
+  workbench only needs migrations for tables the *consumer* would
+  provide (`users`, host-app fixture tables like `articles`).
+- **Or, if the workbench duplicates the package schema for isolation,
+  keeping it in lockstep with model changes.** When `Filable` switched
+  to `HasUuids`, the workbench `filables` table needed the matching
+  `uuid('id')`. Skipping the workbench update means the test suite
+  silently rots — 39 tests went red in laravel-files for ~5 weeks
+  before anyone noticed, because nothing in CI was screaming about
+  the model/schema mismatch.
+
+Pick the first option for new packages. It's less code and
+self-consistent: a passing test suite proves the consumer's install
+flow works.
 
 ### Deviation: laravel-addresses
 
